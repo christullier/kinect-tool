@@ -14,6 +14,30 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import unquote
 
+
+def _reexec_with_py312_venv() -> None:
+    if os.environ.get("KINECT_SKIP_PY312_REEXEC") == "1":
+        return
+    if sys.version_info < (3, 14):
+        return
+
+    project_dir = Path(__file__).resolve().parent
+    venv_dir = project_dir / ".venv312"
+    venv_python = venv_dir / "bin" / "python"
+    if not venv_python.exists() or not (venv_dir / ".kinect-ready").exists():
+        return
+
+    current = Path(sys.executable).resolve()
+    target = venv_python.resolve()
+    if current == target:
+        return
+
+    os.environ["KINECT_SKIP_PY312_REEXEC"] = "1"
+    os.execv(str(target), [str(target), *sys.argv])
+
+
+_reexec_with_py312_venv()
+
 import numpy as np
 from PIL import Image, ImageDraw
 
@@ -53,6 +77,15 @@ class SkeletonTracker:
         self._lock = threading.Lock()
         self._pose = None
         self._error: str | None = None
+        self._disabled_reason: str | None = None
+
+        # MediaPipe 0.10.35 currently installs on Python 3.14, but its macOS
+        # pose landmarker aborts the process while initializing the graph.
+        if mp is not None and sys.version_info >= (3, 14):
+            self._disabled_reason = (
+                "MediaPipe is installed, but pose tracking is not usable under "
+                "Python 3.14 here. Run the server with a Python 3.12 venv."
+            )
 
     def status(self) -> dict:
         if mp is None or pose_landmarker is None:
@@ -60,6 +93,12 @@ class SkeletonTracker:
                 "available": False,
                 "running": False,
                 "error": "Install optional dependency: pip install mediapipe",
+            }
+        if self._disabled_reason:
+            return {
+                "available": False,
+                "running": False,
+                "error": self._disabled_reason,
             }
         if not POSE_MODEL_PATH.exists():
             return {
@@ -75,13 +114,18 @@ class SkeletonTracker:
             }
 
     def overlay(self, rgb: np.ndarray) -> np.ndarray:
+        if self._disabled_reason:
+            return rgb
         if mp is None or pose_landmarker is None or base_options is None or not POSE_MODEL_PATH.exists():
             return rgb
         with self._lock:
             try:
                 if self._pose is None:
                     options = pose_landmarker.PoseLandmarkerOptions(
-                        base_options=base_options.BaseOptions(model_asset_path=str(POSE_MODEL_PATH)),
+                        base_options=base_options.BaseOptions(
+                            model_asset_path=str(POSE_MODEL_PATH),
+                            delegate=base_options.BaseOptions.Delegate.CPU,
+                        ),
                         running_mode=vision_task_running_mode.VisionTaskRunningMode.VIDEO,
                         num_poses=1,
                         min_pose_detection_confidence=0.5,
