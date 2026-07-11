@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Web UI and HTTP streaming server for the Xbox 360 Kinect capture script."""
+"""Web UI and HTTP streaming server for an Xbox 360 Kinect."""
 
 from __future__ import annotations
 
@@ -11,167 +11,16 @@ import threading
 import time
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from urllib.parse import unquote
 
-
-def _reexec_with_py312_venv() -> None:
-    if os.environ.get("KINECT_SKIP_PY312_REEXEC") == "1":
-        return
-    if sys.version_info < (3, 14):
-        return
-
-    project_dir = Path(__file__).resolve().parent
-    venv_dir = project_dir / ".venv312"
-    venv_python = venv_dir / "bin" / "python"
-    if not venv_python.exists() or not (venv_dir / ".kinect-ready").exists():
-        return
-
-    current = Path(sys.executable).resolve()
-    target = venv_python.resolve()
-    if current == target:
-        return
-
-    os.environ["KINECT_SKIP_PY312_REEXEC"] = "1"
-    os.execv(str(target), [str(target), *sys.argv])
-
-
-_reexec_with_py312_venv()
-
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image
 
-os.environ.setdefault("MPLCONFIGDIR", "/tmp/kinect-matplotlib")
-Path(os.environ["MPLCONFIGDIR"]).mkdir(parents=True, exist_ok=True)
-
-try:
-    import mediapipe as mp
-    from mediapipe.tasks.python.core import base_options
-    from mediapipe.tasks.python.vision import pose_landmarker
-    from mediapipe.tasks.python.vision.core import vision_task_running_mode
-except ImportError:
-    mp = None
-    base_options = None
-    pose_landmarker = None
-    vision_task_running_mode = None
-
-from capture import (
-    FREENECT_TILT_MAX,
-    FREENECT_TILT_MIN,
-    HEIGHT,
-    WIDTH,
-    KinectCapture,
-    depth_to_preview,
-    save_frames,
-)
+from capture import HEIGHT, WIDTH, KinectCapture, depth_to_preview
 
 
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 8000
-FRAMES_DIR = Path("frames")
-POSE_MODEL_PATH = Path("models/pose_landmarker_lite.task")
-
-
-class SkeletonTracker:
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._pose = None
-        self._error: str | None = None
-        self._disabled_reason: str | None = None
-
-        # MediaPipe 0.10.35 currently installs on Python 3.14, but its macOS
-        # pose landmarker aborts the process while initializing the graph.
-        if mp is not None and sys.version_info >= (3, 14):
-            self._disabled_reason = (
-                "MediaPipe is installed, but pose tracking is not usable under "
-                "Python 3.14 here. Run the server with a Python 3.12 venv."
-            )
-
-    def status(self) -> dict:
-        if mp is None or pose_landmarker is None:
-            return {
-                "available": False,
-                "running": False,
-                "error": "Install optional dependency: pip install mediapipe",
-            }
-        if self._disabled_reason:
-            return {
-                "available": False,
-                "running": False,
-                "error": self._disabled_reason,
-            }
-        if not POSE_MODEL_PATH.exists():
-            return {
-                "available": False,
-                "running": False,
-                "error": f"Missing pose model: {POSE_MODEL_PATH}",
-            }
-        with self._lock:
-            return {
-                "available": self._error is None,
-                "running": self._pose is not None,
-                "error": self._error,
-            }
-
-    def overlay(self, rgb: np.ndarray) -> np.ndarray:
-        if self._disabled_reason:
-            return rgb
-        if mp is None or pose_landmarker is None or base_options is None or not POSE_MODEL_PATH.exists():
-            return rgb
-        with self._lock:
-            try:
-                if self._pose is None:
-                    options = pose_landmarker.PoseLandmarkerOptions(
-                        base_options=base_options.BaseOptions(
-                            model_asset_path=str(POSE_MODEL_PATH),
-                            delegate=base_options.BaseOptions.Delegate.CPU,
-                        ),
-                        running_mode=vision_task_running_mode.VisionTaskRunningMode.VIDEO,
-                        num_poses=1,
-                        min_pose_detection_confidence=0.5,
-                        min_pose_presence_confidence=0.5,
-                        min_tracking_confidence=0.5,
-                        output_segmentation_masks=False,
-                    )
-                    self._pose = pose_landmarker.PoseLandmarker.create_from_options(options)
-                image = mp.Image(image_format=mp.ImageFormat.SRGB, data=np.ascontiguousarray(rgb))
-                results = self._pose.detect_for_video(image, int(time.time() * 1000))
-                self._error = None
-            except Exception as exc:
-                self._error = str(exc)
-                return rgb
-
-        if not results.pose_landmarks:
-            return rgb
-
-        overlay = Image.fromarray(rgb, mode="RGB")
-        draw = ImageDraw.Draw(overlay)
-        connections = pose_landmarker.PoseLandmarksConnections.POSE_LANDMARKS
-
-        def point(landmarks: list, index: int) -> tuple[int, int] | None:
-            landmark = landmarks[index]
-            if getattr(landmark, "visibility", 1.0) < 0.45:
-                return None
-            x = int(np.clip(landmark.x, 0.0, 1.0) * (WIDTH - 1))
-            y = int(np.clip(landmark.y, 0.0, 1.0) * (HEIGHT - 1))
-            return x, y
-
-        for landmarks in results.pose_landmarks:
-            for connection in connections:
-                a = point(landmarks, connection.start)
-                b = point(landmarks, connection.end)
-                if a and b:
-                    draw.line((a, b), fill=(0, 255, 180), width=4)
-            for index in range(len(landmarks)):
-                p = point(landmarks, index)
-                if p:
-                    x, y = p
-                    draw.ellipse((x - 5, y - 5, x + 5, y + 5), fill=(255, 230, 60), outline=(0, 0, 0))
-
-        return np.asarray(overlay)
-
-
-SKELETON = SkeletonTracker()
 
 
 class KinectService:
@@ -179,7 +28,6 @@ class KinectService:
         self._lock = threading.RLock()
         self._condition = threading.Condition(self._lock)
         self._thread: threading.Thread | None = None
-        self._kinect: KinectCapture | None = None
         self._stop_event = threading.Event()
         self._running = False
         self._starting = False
@@ -188,9 +36,6 @@ class KinectService:
         self._last_depth: np.ndarray | None = None
         self._last_frame_at: float | None = None
         self._frame_count = 0
-        self._tilt_degrees = 0.0
-        self._motor_available = False
-        self._motor_error: str | None = "Stream is stopped"
 
     def start(self) -> dict:
         with self._lock:
@@ -198,6 +43,9 @@ class KinectService:
                 return self.status()
             self._stop_event.clear()
             self._error = None
+            self._last_rgb = None
+            self._last_depth = None
+            self._last_frame_at = None
             self._starting = True
             self._thread = threading.Thread(target=self._capture_loop, daemon=True)
             self._thread.start()
@@ -209,7 +57,7 @@ class KinectService:
             thread = self._thread
         if thread and thread.is_alive():
             thread.join(timeout=3.0)
-        with self._lock:
+        with self._condition:
             self._running = False
             self._starting = False
             self._thread = None
@@ -228,14 +76,7 @@ class KinectService:
                 "lastFrameAt": self._last_frame_at,
                 "lastFrameAgeSeconds": age,
                 "error": self._error,
-                "tiltDegrees": self._tilt_degrees,
-                "tiltRange": {"min": FREENECT_TILT_MIN, "max": FREENECT_TILT_MAX},
-                "motor": {
-                    "available": self._motor_available,
-                    "error": self._motor_error,
-                },
                 "resolution": {"width": WIDTH, "height": HEIGHT},
-                "skeleton": SKELETON.status(),
             }
 
     def latest(self) -> tuple[np.ndarray | None, np.ndarray | None]:
@@ -247,69 +88,30 @@ class KinectService:
     def wait_for_frame(self, last_count: int, timeout_s: float = 5.0) -> tuple[int, np.ndarray | None, np.ndarray | None]:
         deadline = time.monotonic() + timeout_s
         with self._condition:
-            while self._frame_count <= last_count and not self._stop_event.is_set():
+            while (
+                self._frame_count <= last_count
+                and self._error is None
+                and (self._running or self._starting)
+                and not self._stop_event.is_set()
+            ):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
                 self._condition.wait(timeout=remaining)
+            if (
+                self._frame_count <= last_count
+                or self._error is not None
+                or (not self._running and not self._starting)
+            ):
+                return self._frame_count, None, None
             rgb = None if self._last_rgb is None else self._last_rgb.copy()
             depth = None if self._last_depth is None else self._last_depth.copy()
             return self._frame_count, rgb, depth
-
-    def snapshot(self) -> dict:
-        rgb, depth = self.latest()
-        if rgb is None or depth is None:
-            raise RuntimeError("No frame is available yet. Start the stream first.")
-        stem = time.strftime("frame_%Y%m%d_%H%M%S")
-        rgb_path, depth_raw_path, depth_preview_path = save_frames(rgb, depth, FRAMES_DIR, stem)
-        return {
-            "rgb": str(rgb_path),
-            "depthRaw": str(depth_raw_path),
-            "depthPreview": str(depth_preview_path),
-        }
-
-    def set_tilt(self, degrees: float | None = None, delta: float | None = None) -> dict:
-        with self._lock:
-            kinect = self._kinect
-            if kinect is None or not self._running:
-                raise RuntimeError("Start the stream before moving the Kinect motor.")
-            target = self._tilt_degrees
-            if degrees is not None:
-                target = float(degrees)
-            if delta is not None:
-                target += float(delta)
-
-        actual = kinect.set_tilt_degrees(target)
-        with self._lock:
-            self._tilt_degrees = actual
-            return self.status()
-
-    def recent_snapshots(self, limit: int = 40) -> list[dict]:
-        FRAMES_DIR.mkdir(parents=True, exist_ok=True)
-        rgb_files = sorted(FRAMES_DIR.glob("*_rgb.png"), key=lambda p: p.stat().st_mtime, reverse=True)
-        snapshots = []
-        for rgb_path in rgb_files[:limit]:
-            stem = rgb_path.name.removesuffix("_rgb.png")
-            depth_preview = FRAMES_DIR / f"{stem}_depth_preview.png"
-            depth_raw = FRAMES_DIR / f"{stem}_depth_mm.npy"
-            snapshots.append(
-                {
-                    "stem": stem,
-                    "rgb": f"/frames/{rgb_path.name}",
-                    "depthPreview": f"/frames/{depth_preview.name}" if depth_preview.exists() else None,
-                    "depthRaw": f"/frames/{depth_raw.name}" if depth_raw.exists() else None,
-                    "mtime": rgb_path.stat().st_mtime,
-                }
-            )
-        return snapshots
 
     def _capture_loop(self) -> None:
         try:
             with KinectCapture() as kinect:
                 with self._condition:
-                    self._kinect = kinect
-                    self._motor_available = kinect.motor_available
-                    self._motor_error = kinect.motor_error
                     self._running = True
                     self._starting = False
                     self._error = None
@@ -327,14 +129,14 @@ class KinectService:
         except Exception as exc:
             with self._condition:
                 self._error = str(exc)
+                self._last_rgb = None
+                self._last_depth = None
+                self._last_frame_at = None
                 self._running = False
                 self._starting = False
                 self._condition.notify_all()
         finally:
             with self._condition:
-                self._kinect = None
-                self._motor_available = False
-                self._motor_error = "Stream is stopped"
                 self._running = False
                 self._starting = False
                 self._condition.notify_all()
@@ -349,40 +151,9 @@ def encode_rgb_jpeg(rgb: np.ndarray) -> bytes:
     return buffer.getvalue()
 
 
-def encode_skeleton_jpeg(rgb: np.ndarray) -> bytes:
-    return encode_rgb_jpeg(SKELETON.overlay(rgb))
-
-
-def depth_to_dots(depth: np.ndarray, step: int = 3) -> Image.Image:
-    valid = depth[depth > 0]
-    if valid.size == 0:
-        return Image.fromarray(np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8), mode="RGB")
-
-    near = int(np.percentile(valid, 5))
-    far = int(np.percentile(valid, 95))
-    if far <= near:
-        far = near + 1
-
-    sampled = depth[::step, ::step]
-    mask = sampled > 0
-    normalized = np.clip((sampled.astype(np.float32) - near) / (far - near), 0.0, 1.0)
-    brightness = ((1.0 - normalized) * 215 + 40).astype(np.uint8)
-
-    dots = np.zeros((HEIGHT, WIDTH, 3), dtype=np.uint8)
-    y_idx, x_idx = np.nonzero(mask)
-    y_idx *= step
-    x_idx *= step
-
-    dot_values = brightness[mask]
-    dots[y_idx, x_idx, 0] = dot_values
-    dots[y_idx, x_idx, 1] = np.maximum(dot_values, 120)
-    dots[y_idx, x_idx, 2] = 255
-    return Image.fromarray(dots, mode="RGB")
-
-
 def encode_depth_jpeg(depth: np.ndarray) -> bytes:
     buffer = io.BytesIO()
-    depth_to_dots(depth).save(buffer, format="JPEG", quality=88)
+    depth_to_preview(depth).convert("RGB").save(buffer, format="JPEG", quality=88)
     return buffer.getvalue()
 
 
@@ -397,7 +168,7 @@ INDEX_HTML = """<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Kinect Control</title>
+  <title>Kinect Stream</title>
   <style>
     :root {
       color-scheme: dark;
@@ -424,7 +195,7 @@ INDEX_HTML = """<!doctype html>
     .dot.running { background: #2fbf71; }
     .dot.starting { background: #d6a23a; }
     .dot.error { background: #e05d4f; }
-    main { display: grid; grid-template-columns: 260px 1fr; min-height: 0; }
+    main { display: grid; grid-template-columns: 220px 1fr; min-height: 0; }
     aside {
       border-right: 1px solid #2b2f34;
       padding: 16px;
@@ -447,24 +218,6 @@ INDEX_HTML = """<!doctype html>
     button.danger { background: #6e2b2b; border-color: #91413c; }
     button:disabled { opacity: 0.55; cursor: default; }
     label { display: grid; gap: 6px; color: #b9c0c8; font-size: 12px; }
-    .checkbox-row {
-      min-height: 38px;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-      color: #d8dde3;
-      font-size: 13px;
-    }
-    input[type="checkbox"] { width: 16px; height: 16px; accent-color: #2fbf71; }
-    .tilt-pad {
-      display: grid;
-      grid-template-columns: 1fr 1fr 1fr;
-      gap: 8px;
-    }
-    .tilt-pad button {
-      min-width: 0;
-      padding: 0 8px;
-    }
     .readout {
       margin-top: 16px;
       padding-top: 14px;
@@ -475,19 +228,6 @@ INDEX_HTML = """<!doctype html>
       font-size: 13px;
     }
     .error { color: #ffb4ac; overflow-wrap: anywhere; }
-    .snapshots { margin-top: 18px; display: grid; gap: 8px; }
-    .snapshots h2 { margin: 0; font-size: 13px; color: #d8dde3; }
-    .snapshot {
-      display: grid;
-      gap: 5px;
-      padding: 8px;
-      border: 1px solid #2b2f34;
-      border-radius: 7px;
-      background: #1b1e22;
-      font-size: 12px;
-    }
-    .snapshot span { color: #cbd1d7; overflow-wrap: anywhere; }
-    .snapshot a { color: #8fc7ff; text-decoration: none; margin-right: 8px; }
     .viewer { min-width: 0; min-height: 0; padding: 16px; display: grid; grid-template-rows: 1fr; }
     .streams { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; min-height: 0; }
     .streams.rgb-only { grid-template-columns: 1fr; }
@@ -520,7 +260,6 @@ INDEX_HTML = """<!doctype html>
       height: 100%;
       max-height: calc(100vh - 100px);
       object-fit: contain;
-      image-rendering: auto;
       background: #030404;
     }
     @media (max-width: 820px) {
@@ -535,7 +274,7 @@ INDEX_HTML = """<!doctype html>
 <body>
   <div class="app">
     <header>
-      <h1>Kinect Control</h1>
+      <h1>Kinect Stream</h1>
       <div class="status">
         <span id="statusDot" class="dot"></span>
         <span id="stateText">Idle</span>
@@ -550,7 +289,6 @@ INDEX_HTML = """<!doctype html>
             <button id="startBtn" class="primary">Start</button>
             <button id="stopBtn" class="danger">Stop</button>
           </div>
-          <button id="snapshotBtn">Snapshot</button>
           <label>
             View
             <select id="viewMode">
@@ -559,27 +297,11 @@ INDEX_HTML = """<!doctype html>
               <option value="depth-only">Depth only</option>
             </select>
           </label>
-          <label class="checkbox-row">
-            <input id="skeletonToggle" type="checkbox">
-            <span>Skeleton overlay</span>
-          </label>
-          <div class="tilt-pad">
-            <button id="tiltUpBtn" title="Tilt up">Up</button>
-            <button id="tiltCenterBtn" title="Center tilt">Center</button>
-            <button id="tiltDownBtn" title="Tilt down">Down</button>
-          </div>
         </div>
         <div class="readout">
           <div>Resolution: <span id="resolutionText">640 x 480</span></div>
           <div>Server: <span id="serverText"></span></div>
-          <div>Tilt: <span id="tiltText">0 deg</span></div>
-          <div>Motor: <span id="motorText">Stopped</span></div>
-          <div>Skeleton: <span id="skeletonText">Checking</span></div>
           <div id="errorText" class="error"></div>
-        </div>
-        <div class="snapshots">
-          <h2>Snapshots</h2>
-          <div id="snapshotList"></div>
         </div>
       </aside>
       <section class="viewer">
@@ -589,7 +311,7 @@ INDEX_HTML = """<!doctype html>
             <div class="frame-wrap"><img id="rgbStream" class="stream" alt="RGB stream"></div>
           </section>
           <section class="panel depth-panel">
-            <div class="panel-title"><span>Depth Dots</span><span>MJPEG</span></div>
+            <div class="panel-title"><span>Depth</span><span>MJPEG</span></div>
             <div class="frame-wrap"><img id="depthStream" class="stream" alt="Depth stream"></div>
           </section>
         </div>
@@ -604,32 +326,20 @@ INDEX_HTML = """<!doctype html>
       ageText: document.getElementById("ageText"),
       startBtn: document.getElementById("startBtn"),
       stopBtn: document.getElementById("stopBtn"),
-      snapshotBtn: document.getElementById("snapshotBtn"),
-      tiltUpBtn: document.getElementById("tiltUpBtn"),
-      tiltCenterBtn: document.getElementById("tiltCenterBtn"),
-      tiltDownBtn: document.getElementById("tiltDownBtn"),
       viewMode: document.getElementById("viewMode"),
-      skeletonToggle: document.getElementById("skeletonToggle"),
       streams: document.getElementById("streams"),
       rgbStream: document.getElementById("rgbStream"),
       depthStream: document.getElementById("depthStream"),
       resolutionText: document.getElementById("resolutionText"),
       serverText: document.getElementById("serverText"),
-      tiltText: document.getElementById("tiltText"),
-      motorText: document.getElementById("motorText"),
-      skeletonText: document.getElementById("skeletonText"),
-      errorText: document.getElementById("errorText"),
-      snapshotList: document.getElementById("snapshotList")
+      errorText: document.getElementById("errorText")
     };
 
-    let motorAvailable = false;
+    let latestStatus = null;
+    let requestBusy = false;
 
     els.serverText.textContent = window.location.host;
-    function setRgbStream() {
-      const path = els.skeletonToggle.checked ? "/stream/skeleton.mjpg" : "/stream/rgb.mjpg";
-      if (!els.rgbStream.src.endsWith(path)) els.rgbStream.src = path;
-    }
-    setRgbStream();
+    els.rgbStream.src = "/stream/rgb.mjpg";
     els.depthStream.src = "/stream/depth.mjpg";
 
     async function api(path, options = {}) {
@@ -639,16 +349,20 @@ INDEX_HTML = """<!doctype html>
       return data;
     }
 
+    function updateControls(status = latestStatus) {
+      const running = Boolean(status && status.running);
+      const starting = Boolean(status && status.starting);
+      els.startBtn.disabled = requestBusy || running || starting;
+      els.stopBtn.disabled = requestBusy || (!running && !starting);
+    }
+
     function setBusy(isBusy) {
-      els.startBtn.disabled = isBusy;
-      els.stopBtn.disabled = isBusy;
-      els.snapshotBtn.disabled = isBusy;
-      els.tiltUpBtn.disabled = isBusy || !motorAvailable;
-      els.tiltCenterBtn.disabled = isBusy || !motorAvailable;
-      els.tiltDownBtn.disabled = isBusy || !motorAvailable;
+      requestBusy = isBusy;
+      updateControls();
     }
 
     function renderStatus(status) {
+      latestStatus = status;
       els.statusDot.className = "dot";
       if (status.error) els.statusDot.classList.add("error");
       else if (status.starting) els.statusDot.classList.add("starting");
@@ -658,56 +372,12 @@ INDEX_HTML = """<!doctype html>
       els.ageText.textContent = status.lastFrameAgeSeconds == null ? "No frame" : `${status.lastFrameAgeSeconds.toFixed(1)}s ago`;
       els.errorText.textContent = status.error || "";
       els.resolutionText.textContent = `${status.resolution.width} x ${status.resolution.height}`;
-      els.tiltText.textContent = `${Number(status.tiltDegrees || 0).toFixed(1)} deg`;
-      if (status.motor) renderMotorStatus(status.motor);
-      if (status.skeleton) renderSkeletonStatus(status.skeleton);
-    }
-
-    function renderMotorStatus(motor) {
-      motorAvailable = Boolean(motor.available);
-      els.motorText.textContent = motorAvailable ? "Available" : (motor.error || "Unavailable");
-      els.tiltUpBtn.disabled = !motorAvailable;
-      els.tiltCenterBtn.disabled = !motorAvailable;
-      els.tiltDownBtn.disabled = !motorAvailable;
-    }
-
-    function renderSkeletonStatus(skeleton) {
-      els.skeletonToggle.disabled = !skeleton.available;
-      els.skeletonText.textContent = skeleton.available ? (skeleton.running ? "Running" : "Available") : skeleton.error || "Unavailable";
-      if (!skeleton.available && els.skeletonToggle.checked) {
-        els.skeletonToggle.checked = false;
-        setRgbStream();
-      }
-    }
-
-    function renderSnapshots(items) {
-      if (!items.length) {
-        els.snapshotList.innerHTML = '<div class="snapshot"><span>No snapshots yet</span></div>';
-        return;
-      }
-      els.snapshotList.innerHTML = items.map(item => `
-        <div class="snapshot">
-          <span>${item.stem}</span>
-          <div>
-            <a href="${item.rgb}" target="_blank">RGB</a>
-            ${item.depthPreview ? `<a href="${item.depthPreview}" target="_blank">Depth</a>` : ""}
-            ${item.depthRaw ? `<a href="${item.depthRaw}" target="_blank">Raw</a>` : ""}
-          </div>
-        </div>
-      `).join("");
+      updateControls(status);
     }
 
     async function refresh() {
       try {
         renderStatus(await api("/api/status"));
-      } catch (err) {
-        els.errorText.textContent = err.message;
-      }
-    }
-
-    async function refreshSnapshots() {
-      try {
-        renderSnapshots(await api("/api/snapshots"));
       } catch (err) {
         els.errorText.textContent = err.message;
       }
@@ -727,47 +397,12 @@ INDEX_HTML = """<!doctype html>
       finally { setBusy(false); }
     });
 
-    els.snapshotBtn.addEventListener("click", async () => {
-      setBusy(true);
-      try {
-        await api("/api/snapshot", { method: "POST" });
-        await refreshSnapshots();
-      } catch (err) {
-        els.errorText.textContent = err.message;
-      } finally {
-        setBusy(false);
-      }
-    });
-
-    async function moveTilt(payload) {
-      setBusy(true);
-      try {
-        renderStatus(await api("/api/tilt", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload)
-        }));
-      } catch (err) {
-        els.errorText.textContent = err.message;
-      } finally {
-        setBusy(false);
-      }
-    }
-
-    els.tiltUpBtn.addEventListener("click", () => moveTilt({ delta: 5 }));
-    els.tiltCenterBtn.addEventListener("click", () => moveTilt({ degrees: 0 }));
-    els.tiltDownBtn.addEventListener("click", () => moveTilt({ delta: -5 }));
-
     els.viewMode.addEventListener("change", () => {
       els.streams.className = `streams ${els.viewMode.value === "split" ? "" : els.viewMode.value}`;
     });
 
-    els.skeletonToggle.addEventListener("change", setRgbStream);
-
     refresh();
-    refreshSnapshots();
     setInterval(refresh, 1000);
-    setInterval(refreshSnapshots, 5000);
   </script>
 </body>
 </html>
@@ -783,22 +418,14 @@ class KinectRequestHandler(BaseHTTPRequestHandler):
             self._send_bytes(INDEX_HTML.encode("utf-8"), "text/html; charset=utf-8")
         elif path == "/api/status":
             self._send_json(SERVICE.status())
-        elif path == "/api/skeleton":
-            self._send_json(SKELETON.status())
-        elif path == "/api/snapshots":
-            self._send_json(SERVICE.recent_snapshots())
         elif path == "/api/latest/rgb.png":
             self._send_latest_rgb()
         elif path == "/api/latest/depth.png":
             self._send_latest_depth()
         elif path == "/stream/rgb.mjpg":
             self._send_stream("rgb")
-        elif path == "/stream/skeleton.mjpg":
-            self._send_stream("skeleton")
         elif path == "/stream/depth.mjpg":
             self._send_stream("depth")
-        elif path.startswith("/frames/"):
-            self._send_frame_file(path)
         else:
             self._send_error_json(HTTPStatus.NOT_FOUND, "Not found")
 
@@ -809,16 +436,6 @@ class KinectRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(SERVICE.start())
             elif path == "/api/stop":
                 self._send_json(SERVICE.stop())
-            elif path == "/api/snapshot":
-                self._send_json(SERVICE.snapshot(), status=HTTPStatus.CREATED)
-            elif path == "/api/tilt":
-                payload = self._read_json()
-                self._send_json(
-                    SERVICE.set_tilt(
-                        degrees=payload.get("degrees"),
-                        delta=payload.get("delta"),
-                    )
-                )
             else:
                 self._send_error_json(HTTPStatus.NOT_FOUND, "Not found")
         except Exception as exc:
@@ -829,13 +446,6 @@ class KinectRequestHandler(BaseHTTPRequestHandler):
 
     def _path(self) -> str:
         return unquote(self.path.split("?", 1)[0])
-
-    def _read_json(self) -> dict:
-        length = int(self.headers.get("Content-Length", "0") or "0")
-        if length <= 0:
-            return {}
-        data = self.rfile.read(length)
-        return json.loads(data.decode("utf-8"))
 
     def _send_latest_rgb(self) -> None:
         rgb, _depth = SERVICE.latest()
@@ -866,11 +476,6 @@ class KinectRequestHandler(BaseHTTPRequestHandler):
                         time.sleep(0.15)
                         continue
                     payload = encode_rgb_jpeg(rgb)
-                elif kind == "skeleton":
-                    if rgb is None:
-                        time.sleep(0.15)
-                        continue
-                    payload = encode_skeleton_jpeg(rgb)
                 else:
                     if depth is None:
                         time.sleep(0.15)
@@ -884,21 +489,6 @@ class KinectRequestHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 break
-
-    def _send_frame_file(self, path: str) -> None:
-        name = Path(path.removeprefix("/frames/")).name
-        file_path = FRAMES_DIR / name
-        if not file_path.exists() or not file_path.is_file():
-            self._send_error_json(HTTPStatus.NOT_FOUND, "Frame file not found")
-            return
-        if file_path.suffix == ".png":
-            content_type = "image/png"
-        elif file_path.suffix == ".npy":
-            content_type = "application/octet-stream"
-        else:
-            self._send_error_json(HTTPStatus.FORBIDDEN, "Unsupported frame file type")
-            return
-        self._send_bytes(file_path.read_bytes(), content_type)
 
     def _send_json(self, payload: object, status: HTTPStatus = HTTPStatus.OK) -> None:
         data = json.dumps(payload).encode("utf-8")
@@ -920,11 +510,11 @@ def main() -> int:
     host = os.environ.get("KINECT_HOST", DEFAULT_HOST)
     port = int(os.environ.get("KINECT_PORT", os.environ.get("PORT", str(DEFAULT_PORT))))
     server = ThreadingHTTPServer((host, port), KinectRequestHandler)
-    print(f"Serving Kinect UI on http://{host}:{port}", flush=True)
+    print(f"Serving Kinect stream on http://{host}:{port}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nStopping server", flush=True)
+        pass
     finally:
         SERVICE.stop()
         server.server_close()
