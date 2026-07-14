@@ -176,7 +176,7 @@ def depth_to_preview(depth_mm: np.ndarray) -> Image.Image:
     far = int(np.percentile(valid, 95))
     if far <= near:
         far = near + 1
-    clipped = np.clip(depth_mm, near, far)
-    preview = ((clipped - near) * 255 / (far - near)).astype(np.uint8)
+    clipped = np.clip(depth_mm, near, far).astype(np.float32)
+    preview = ((clipped - near) * (255.0 / (far - near))).astype(np.uint8)
     preview[depth_mm == 0] = 0
     return Image.fromarray(preview, mode="L")
