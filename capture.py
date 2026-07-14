@@ -25,6 +25,8 @@ def _load_libfreenect() -> ctypes.CDLL:
         "libfreenect.0.7.5.dylib",
         "libfreenect.0.dylib",
         "libfreenect.dylib",
+        "libfreenect.so",
+        "libfreenect.so.0.5",
         "freenect",
     ):
         try:
